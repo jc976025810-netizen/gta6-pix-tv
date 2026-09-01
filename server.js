@@ -13,8 +13,17 @@ const BASE_URL = process.env.PUBLIC_BASE_URL;
 
 const META = 550;
 
+// Pedidos criados nesta execução do servidor
+const pedidos = new Map();
+
+// Transações já processadas
+const transacoesProcessadas = new Set();
+
 let totalArrecadado = 0;
-const transacoes = new Set();
+
+// =========================
+// PÁGINAS
+// =========================
 
 app.get("/", (req, res) => {
   res.sendFile(path.join(__dirname, "public", "index.html"));
@@ -24,12 +33,20 @@ app.get("/doar", (req, res) => {
   res.sendFile(path.join(__dirname, "public", "donate.html"));
 });
 
+// =========================
+// META
+// =========================
+
 app.get("/api/meta", (req, res) => {
   res.json({
-    arrecadado: totalArrecadado,
+    arrecadado: Number(totalArrecadado.toFixed(2)),
     meta: META
   });
 });
+
+// =========================
+// CRIAR CHECKOUT
+// =========================
 
 app.post("/api/create-payment", async (req, res) => {
   try {
@@ -42,6 +59,8 @@ app.post("/api/create-payment", async (req, res) => {
     }
 
     if (!HANDLE || !BASE_URL) {
+      console.error("Variáveis de ambiente ausentes.");
+
       return res.status(500).json({
         error: "Configuração do pagamento incompleta."
       });
@@ -52,6 +71,13 @@ app.post("/api/create-payment", async (req, res) => {
       Date.now() +
       "-" +
       crypto.randomBytes(4).toString("hex");
+
+    // Guardamos o pedido antes de enviar para a InfinitePay.
+    pedidos.set(order_nsu, {
+      valor: Number(valor.toFixed(2)),
+      criadoEm: new Date().toISOString(),
+      pago: false
+    });
 
     const pagamento = {
       handle: HANDLE,
@@ -73,6 +99,11 @@ app.post("/api/create-payment", async (req, res) => {
       ]
     };
 
+    console.log("Criando checkout:", {
+      order_nsu,
+      valor
+    });
+
     const resposta = await fetch(
       "https://api.checkout.infinitepay.io/links",
       {
@@ -87,19 +118,33 @@ app.post("/api/create-payment", async (req, res) => {
     const dados = await resposta.json();
 
     if (!resposta.ok || !dados.url) {
-      console.error("Resposta InfinitePay:", dados);
+      console.error(
+        "Erro da InfinitePay:",
+        dados
+      );
+
+      pedidos.delete(order_nsu);
 
       return res.status(400).json({
-        error: "A InfinitePay não conseguiu criar o pagamento."
+        error:
+          "A InfinitePay não conseguiu criar o pagamento."
       });
     }
+
+    console.log(
+      "Checkout criado:",
+      order_nsu
+    );
 
     res.json({
       url: dados.url
     });
 
   } catch (erro) {
-    console.error("Erro:", erro);
+    console.error(
+      "Erro ao criar pagamento:",
+      erro
+    );
 
     res.status(500).json({
       error: "Erro ao criar pagamento."
@@ -107,39 +152,135 @@ app.post("/api/create-payment", async (req, res) => {
   }
 });
 
+// =========================
+// WEBHOOK INFINITEPAY
+// =========================
+
 app.post("/webhook/infinitepay", (req, res) => {
-  const pagamento = req.body || {};
+  try {
+    const pagamento = req.body || {};
 
-  console.log("Webhook InfinitePay recebido:", pagamento);
+    console.log(
+      "Webhook InfinitePay recebido:",
+      JSON.stringify(pagamento)
+    );
 
-  const transaction_nsu = pagamento.transaction_nsu;
-  const capture_method = pagamento.capture_method;
-  const paid_amount = Number(pagamento.paid_amount || 0);
+    const order_nsu = pagamento.order_nsu;
+    const transaction_nsu = pagamento.transaction_nsu;
+    const capture_method = pagamento.capture_method;
 
-  if (
-    transaction_nsu &&
-    !transacoes.has(transaction_nsu) &&
-    capture_method === "pix" &&
-    paid_amount > 0
-  ) {
-    const valor = paid_amount / 100;
+    const paidAmount = Number(
+      pagamento.paid_amount || 0
+    );
 
-    transacoes.add(transaction_nsu);
+    // O pedido precisa existir no nosso sistema.
+    const pedido = pedidos.get(order_nsu);
+
+    if (!pedido) {
+      console.warn(
+        "Pedido não encontrado:",
+        order_nsu
+      );
+
+      return res.status(400).json({
+        success: false,
+        message: "Pedido não encontrado"
+      });
+    }
+
+    // Impede contabilizar a mesma transação duas vezes.
+    if (
+      transaction_nsu &&
+      transacoesProcessadas.has(transaction_nsu)
+    ) {
+      return res.status(200).json({
+        success: true,
+        message: null
+      });
+    }
+
+    // Só contabilizamos Pix.
+    if (capture_method !== "pix") {
+      console.warn(
+        "Pagamento não é Pix:",
+        capture_method
+      );
+
+      return res.status(400).json({
+        success: false,
+        message: "Pagamento não é Pix"
+      });
+    }
+
+    if (!Number.isFinite(paidAmount) || paidAmount <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Valor inválido"
+      });
+    }
+
+    const valorPago = paidAmount / 100;
+
+    // Confere se o valor recebido bate com o pedido.
+    if (
+      Math.abs(valorPago - pedido.valor) > 0.01
+    ) {
+      console.warn(
+        "Valor diferente do pedido:",
+        {
+          esperado: pedido.valor,
+          recebido: valorPago
+        }
+      );
+
+      return res.status(400).json({
+        success: false,
+        message: "Valor do pagamento diferente do pedido"
+      });
+    }
+
+    // Marca como pago.
+    pedido.pago = true;
+
+    if (transaction_nsu) {
+      transacoesProcessadas.add(
+        transaction_nsu
+      );
+    }
 
     totalArrecadado = Number(
-      (totalArrecadado + valor).toFixed(2)
+      (
+        totalArrecadado +
+        valorPago
+      ).toFixed(2)
     );
 
     console.log(
-      `Pix confirmado: R$ ${valor.toFixed(2)}`
+      `Pagamento confirmado: R$ ${valorPago.toFixed(2)}`
     );
-  }
 
-  res.status(200).json({
-    success: true,
-    message: null
-  });
+    // A InfinitePay espera resposta rápida com HTTP 200.
+    return res.status(200).json({
+      success: true,
+      message: null
+    });
+
+  } catch (erro) {
+    console.error(
+      "Erro no webhook:",
+      erro
+    );
+
+    return res.status(500).json({
+      success: false,
+      message: "Erro interno"
+    });
+  }
 });
+
+// =========================
+// SERVIDOR
+// =========================
 
 app.listen(PORT, () => {
   console.log(
