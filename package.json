@@ -1,0 +1,12 @@
+{
+  "name": "gta6-pix-tv",
+  "version": "1.0.0",
+  "description": "Tela de meta GTA VI com Pix",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}
