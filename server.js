@@ -1,5 +1,6 @@
 const express = require("express");
 const path = require("path");
+const crypto = require("crypto");
 
 const app = express();
 
@@ -7,66 +8,136 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
 
 const PORT = process.env.PORT || 3000;
+const HANDLE = process.env.INFINITEPAY_HANDLE;
+const BASE_URL = process.env.PUBLIC_BASE_URL;
+
+const META = 550;
 
 let totalArrecadado = 0;
+const transacoes = new Set();
 
-// Página principal
 app.get("/", (req, res) => {
   res.sendFile(path.join(__dirname, "public", "index.html"));
 });
 
-// Página de contribuição
 app.get("/doar", (req, res) => {
   res.sendFile(path.join(__dirname, "public", "donate.html"));
 });
 
-// Meta atual
 app.get("/api/meta", (req, res) => {
   res.json({
     arrecadado: totalArrecadado,
-    meta: 550
+    meta: META
   });
 });
 
-// Criar pagamento
-app.post("/api/create-payment", (req, res) => {
-  const valor = Number(req.body.amount);
+app.post("/api/create-payment", async (req, res) => {
+  try {
+    const valor = Number(req.body.amount);
 
-  if (!valor || valor <= 0 || valor > 550) {
-    return res.status(400).json({
-      error: "Valor inválido."
+    if (!Number.isFinite(valor) || valor <= 0 || valor > META) {
+      return res.status(400).json({
+        error: "Valor inválido."
+      });
+    }
+
+    if (!HANDLE || !BASE_URL) {
+      return res.status(500).json({
+        error: "Configuração do pagamento incompleta."
+      });
+    }
+
+    const order_nsu =
+      "GTA6-" +
+      Date.now() +
+      "-" +
+      crypto.randomBytes(4).toString("hex");
+
+    const pagamento = {
+      handle: HANDLE,
+
+      redirect_url:
+        `${BASE_URL}/doar?pagamento=concluido`,
+
+      webhook_url:
+        `${BASE_URL}/webhook/infinitepay`,
+
+      order_nsu,
+
+      items: [
+        {
+          quantity: 1,
+          price: Math.round(valor * 100),
+          description: "Contribuição para o presente GTA VI"
+        }
+      ]
+    };
+
+    const resposta = await fetch(
+      "https://api.checkout.infinitepay.io/links",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(pagamento)
+      }
+    );
+
+    const dados = await resposta.json();
+
+    if (!resposta.ok || !dados.url) {
+      console.error("Resposta InfinitePay:", dados);
+
+      return res.status(400).json({
+        error: "A InfinitePay não conseguiu criar o pagamento."
+      });
+    }
+
+    res.json({
+      url: dados.url
+    });
+
+  } catch (erro) {
+    console.error("Erro:", erro);
+
+    res.status(500).json({
+      error: "Erro ao criar pagamento."
     });
   }
-
-  res.status(501).json({
-    error: "Pagamento ainda não configurado."
-  });
 });
 
-// Webhook InfinitePay
 app.post("/webhook/infinitepay", (req, res) => {
-  console.log("Webhook recebido:", req.body);
+  const pagamento = req.body || {};
 
-  const pagamento = req.body;
+  console.log("Webhook InfinitePay recebido:", pagamento);
+
+  const transaction_nsu = pagamento.transaction_nsu;
+  const capture_method = pagamento.capture_method;
+  const paid_amount = Number(pagamento.paid_amount || 0);
 
   if (
-    pagamento.capture_method === "pix" &&
-    pagamento.paid_amount
+    transaction_nsu &&
+    !transacoes.has(transaction_nsu) &&
+    capture_method === "pix" &&
+    paid_amount > 0
   ) {
-    const valor = Number(pagamento.paid_amount) / 100;
+    const valor = paid_amount / 100;
 
-    if (valor > 0) {
-      totalArrecadado += valor;
+    transacoes.add(transaction_nsu);
 
-      console.log(
-        "Pix recebido: R$",
-        valor.toFixed(2)
-      );
-    }
+    totalArrecadado = Number(
+      (totalArrecadado + valor).toFixed(2)
+    );
+
+    console.log(
+      `Pix confirmado: R$ ${valor.toFixed(2)}`
+    );
   }
 
   res.status(200).json({
-    success: true
+    success: true,
+    message: null
   });
 });
 
