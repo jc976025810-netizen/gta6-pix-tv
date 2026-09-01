@@ -10,17 +10,17 @@ const PORT = process.env.PORT || 3000;
 
 let totalArrecadado = 0;
 
-// Tela principal
+// Página principal
 app.get("/", (req, res) => {
   res.sendFile(path.join(__dirname, "public", "index.html"));
 });
 
-// Página para contribuição
+// Página de contribuição
 app.get("/doar", (req, res) => {
   res.sendFile(path.join(__dirname, "public", "donate.html"));
 });
 
-// Valor atual da meta
+// Meta atual
 app.get("/api/meta", (req, res) => {
   res.json({
     arrecadado: totalArrecadado,
@@ -28,9 +28,23 @@ app.get("/api/meta", (req, res) => {
   });
 });
 
-// Webhook da InfinitePay
-app.post("/webhook/infinitepay", (req, res) => {
+// Criar pagamento
+app.post("/api/create-payment", (req, res) => {
+  const valor = Number(req.body.amount);
 
+  if (!valor || valor <= 0 || valor > 550) {
+    return res.status(400).json({
+      error: "Valor inválido."
+    });
+  }
+
+  res.status(501).json({
+    error: "Pagamento ainda não configurado."
+  });
+});
+
+// Webhook InfinitePay
+app.post("/webhook/infinitepay", (req, res) => {
   console.log("Webhook recebido:", req.body);
 
   const pagamento = req.body;
@@ -39,7 +53,6 @@ app.post("/webhook/infinitepay", (req, res) => {
     pagamento.capture_method === "pix" &&
     pagamento.paid_amount
   ) {
-
     const valor = Number(pagamento.paid_amount) / 100;
 
     if (valor > 0) {
