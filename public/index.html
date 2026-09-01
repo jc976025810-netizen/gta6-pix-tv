@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Meta GTA VI</title>
+
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: #080b10;
+      color: white;
+      font-family: Arial, sans-serif;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .container {
+      width: 90%;
+      max-width: 900px;
+      text-align: center;
+    }
+
+    h1 {
+      font-size: clamp(50px, 10vw, 100px);
+      margin: 0;
+      color: #ff4fd8;
+    }
+
+    h2 {
+      font-size: clamp(20px, 3vw, 32px);
+      color: #aaa;
+      margin-bottom: 45px;
+    }
+
+    .valor {
+      font-size: clamp(45px, 9vw, 90px);
+      font-weight: bold;
+    }
+
+    .meta {
+      color: #999;
+      font-size: 22px;
+      margin-bottom: 25px;
+    }
+
+    .barra {
+      width: 100%;
+      height: 35px;
+      background: #242b35;
+      border-radius: 50px;
+      overflow: hidden;
+    }
+
+    .progresso {
+      width: 0%;
+      height: 100%;
+      background: #ff4fd8;
+      transition: width 0.8s ease;
+    }
+
+    .porcentagem {
+      margin-top: 20px;
+      font-size: 35px;
+      font-weight: bold;
+    }
+
+    .texto {
+      margin-top: 35px;
+      font-size: 20px;
+      color: #aaa;
+    }
+  </style>
+</head>
+
+<body>
+
+  <div class="container">
+
+    <h1>GTA VI</h1>
+
+    <h2>🎂 PRESENTE DE ANIVERSÁRIO</h2>
+
+    <div id="valor" class="valor">
+      R$ 0,00
+    </div>
+
+    <div class="meta">
+      Meta: R$ 550,00
+    </div>
+
+    <div class="barra">
+      <div id="progresso" class="progresso"></div>
+    </div>
+
+    <div id="porcentagem" class="porcentagem">
+      0%
+    </div>
+
+    <div class="texto">
+      💰 Cada Pix ajuda a chegar no GTA VI!
+    </div>
+
+  </div>
+
+  <script>
+
+    async function atualizar() {
+
+      try {
+
+        const resposta = await fetch("/api/meta");
+        const dados = await resposta.json();
+
+        const arrecadado = Number(dados.arrecadado);
+        const meta = Number(dados.meta);
+
+        document.getElementById("valor").textContent =
+          arrecadado.toLocaleString("pt-BR", {
+            style: "currency",
+            currency: "BRL"
+          });
+
+        const porcentagem =
+          Math.min((arrecadado / meta) * 100, 100);
+
+        document.getElementById("progresso").style.width =
+          porcentagem + "%";
+
+        document.getElementById("porcentagem").textContent =
+          Math.round(porcentagem) + "%";
+
+      } catch (erro) {
+
+        console.log("Erro:", erro);
+
+      }
+
+    }
+
+    atualizar();
+
+    setInterval(atualizar, 3000);
+
+  </script>
+
+</body>
+</html>
