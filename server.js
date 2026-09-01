@@ -18,15 +18,25 @@ if (!process.env.DATABASE_URL) {
   process.exit(1);
 }
 
+if (!HANDLE) {
+  console.error("INFINITEPAY_HANDLE não configurado.");
+  process.exit(1);
+}
+
+if (!BASE_URL) {
+  console.error("PUBLIC_BASE_URL não configurada.");
+  process.exit(1);
+}
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
   max: 5
 });
 
-// =========================
-// BANCO
-// =========================
+// =====================================================
+// BANCO DE DADOS
+// =====================================================
 
 async function iniciarBanco() {
   await pool.query(`
@@ -51,9 +61,9 @@ async function iniciarBanco() {
   console.log("Banco de dados conectado e tabelas prontas.");
 }
 
-// =========================
+// =====================================================
 // META
-// =========================
+// =====================================================
 
 app.get("/api/meta", async (req, res) => {
   try {
@@ -62,8 +72,10 @@ app.get("/api/meta", async (req, res) => {
       FROM pagamentos
     `);
 
+    const arrecadado = Number(resultado.rows[0].total);
+
     res.json({
-      arrecadado: Number(resultado.rows[0].total),
+      arrecadado,
       meta: META
     });
 
@@ -76,9 +88,9 @@ app.get("/api/meta", async (req, res) => {
   }
 });
 
-// =========================
+// =====================================================
 // PÁGINAS
-// =========================
+// =====================================================
 
 app.get("/", (req, res) => {
   res.sendFile(
@@ -95,23 +107,20 @@ app.get("/doar", async (req, res) => {
       capture_method
     } = req.query;
 
-    // Se voltou da InfinitePay após um pagamento,
-    // tenta confirmar automaticamente.
+    console.log("Acesso /doar:", {
+      order_nsu,
+      slug,
+      transaction_nsu,
+      capture_method
+    });
+
+    // Se o comprador voltou da InfinitePay
+    // depois de concluir o pagamento.
     if (
       order_nsu &&
       slug &&
       transaction_nsu
     ) {
-      console.log(
-        "Retorno da InfinitePay:",
-        {
-          order_nsu,
-          slug,
-          transaction_nsu,
-          capture_method
-        }
-      );
-
       await confirmarPagamento({
         order_nsu,
         slug,
@@ -135,9 +144,9 @@ app.get("/doar", async (req, res) => {
   }
 });
 
-// =========================
-// CONFIRMAR PAGAMENTO
-// =========================
+// =====================================================
+// CONFIRMAÇÃO PELO PAYMENT_CHECK
+// =====================================================
 
 async function confirmarPagamento({
   order_nsu,
@@ -145,16 +154,14 @@ async function confirmarPagamento({
   transaction_nsu
 }) {
   try {
-    console.log(
-      "Consultando payment_check:",
-      {
-        order_nsu,
-        transaction_nsu,
-        slug
-      }
-    );
+    console.log("=================================");
+    console.log("CONFIRMANDO PAGAMENTO");
+    console.log("order_nsu:", order_nsu);
+    console.log("slug:", slug);
+    console.log("transaction_nsu:", transaction_nsu);
+    console.log("=================================");
 
-    // Procura o pedido
+    // Verifica se o pedido existe
     const pedidoResult = await pool.query(
       `
       SELECT *
@@ -175,17 +182,17 @@ async function confirmarPagamento({
 
     const pedido = pedidoResult.rows[0];
 
-    // Já foi contabilizado
+    // Se já foi pago, não contabiliza novamente
     if (pedido.pago) {
       console.log(
-        "Pedido já estava pago:",
+        "Pedido já contabilizado:",
         order_nsu
       );
 
       return true;
     }
 
-    // Verifica se a transação já existe
+    // Verifica duplicidade da transação
     const existente = await pool.query(
       `
       SELECT transaction_nsu
@@ -196,17 +203,27 @@ async function confirmarPagamento({
     );
 
     if (existente.rows.length > 0) {
+      console.log(
+        "Transação já registrada:",
+        transaction_nsu
+      );
+
       return true;
     }
 
-    // Consulta oficial da InfinitePay
+    // =================================================
+    // PAYMENT CHECK OFICIAL
+    // =================================================
+
     const resposta = await fetch(
       "https://api.checkout.infinitepay.io/payment_check",
       {
         method: "POST",
+
         headers: {
           "Content-Type": "application/json"
         },
+
         body: JSON.stringify({
           handle: HANDLE,
           order_nsu,
@@ -216,12 +233,29 @@ async function confirmarPagamento({
       }
     );
 
-    const dados = await resposta.json();
+    const texto = await resposta.text();
+
+    let dados;
+
+    try {
+      dados = JSON.parse(texto);
+    } catch {
+      console.error(
+        "Resposta inválida da InfinitePay:",
+        texto
+      );
+
+      return false;
+    }
 
     console.log(
       "Resposta payment_check:",
       JSON.stringify(dados)
     );
+
+    // A InfinitePay precisa confirmar:
+    // success = true
+    // paid = true
 
     if (
       !resposta.ok ||
@@ -229,23 +263,56 @@ async function confirmarPagamento({
       dados.paid !== true
     ) {
       console.warn(
-        "Pagamento não confirmado."
+        "Pagamento NÃO confirmado."
       );
 
       return false;
     }
 
+    // =================================================
+    // VALOR
+    // =================================================
+
+    // O amount representa o valor original
+    // da cobrança em centavos.
     const valorPago =
-      Number(dados.paid_amount || dados.amount || 0) / 100;
+      Number(dados.amount) / 100;
 
     if (
       !Number.isFinite(valorPago) ||
       valorPago <= 0
     ) {
+      console.error(
+        "Valor inválido recebido:",
+        dados.amount
+      );
+
       return false;
     }
 
-    // Registra pagamento
+    // Garante que o valor confirmado
+    // corresponde ao pedido.
+    const valorPedido =
+      Number(pedido.valor);
+
+    if (
+      Math.abs(valorPago - valorPedido) > 0.01
+    ) {
+      console.error(
+        "Valor diferente do pedido!",
+        {
+          pedido: valorPedido,
+          recebido: valorPago
+        }
+      );
+
+      return false;
+    }
+
+    // =================================================
+    // SALVA PAGAMENTO
+    // =================================================
+
     await pool.query(
       `
       INSERT INTO pagamentos
@@ -279,7 +346,15 @@ async function confirmarPagamento({
     );
 
     console.log(
+      "================================="
+    );
+
+    console.log(
       `PAGAMENTO CONFIRMADO: R$ ${valorPago.toFixed(2)}`
+    );
+
+    console.log(
+      "================================="
     );
 
     return true;
@@ -294,9 +369,9 @@ async function confirmarPagamento({
   }
 }
 
-// =========================
+// =====================================================
 // CRIAR CHECKOUT
-// =========================
+// =====================================================
 
 app.post("/api/create-payment", async (req, res) => {
   try {
@@ -312,19 +387,13 @@ app.post("/api/create-payment", async (req, res) => {
       });
     }
 
-    if (!HANDLE || !BASE_URL) {
-      return res.status(500).json({
-        error: "Configuração do pagamento incompleta."
-      });
-    }
-
     const order_nsu =
       "GTA6-" +
       Date.now() +
       "-" +
       crypto.randomBytes(4).toString("hex");
 
-    // Salva pedido
+    // Salva pedido no banco
     await pool.query(
       `
       INSERT INTO pedidos
@@ -341,6 +410,9 @@ app.post("/api/create-payment", async (req, res) => {
     const pagamento = {
       handle: HANDLE,
 
+      // A InfinitePay adicionará os parâmetros
+      // order_nsu, slug e transaction_nsu
+      // quando o pagamento for concluído.
       redirect_url:
         `${BASE_URL}/doar`,
 
@@ -361,23 +433,46 @@ app.post("/api/create-payment", async (req, res) => {
 
     console.log(
       "Criando checkout:",
-      order_nsu
+      {
+        order_nsu,
+        valor
+      }
     );
 
     const resposta = await fetch(
       "https://api.checkout.infinitepay.io/links",
       {
         method: "POST",
+
         headers: {
           "Content-Type": "application/json"
         },
+
         body: JSON.stringify(pagamento)
       }
     );
 
-    const dados = await resposta.json();
+    const texto = await resposta.text();
 
-    if (!resposta.ok || !dados.url) {
+    let dados;
+
+    try {
+      dados = JSON.parse(texto);
+    } catch {
+      console.error(
+        "Resposta inválida ao criar checkout:",
+        texto
+      );
+
+      return res.status(500).json({
+        error: "Resposta inválida da InfinitePay."
+      });
+    }
+
+    if (
+      !resposta.ok ||
+      !dados.url
+    ) {
       console.error(
         "Erro da InfinitePay:",
         dados
@@ -418,134 +513,154 @@ app.post("/api/create-payment", async (req, res) => {
   }
 });
 
-// =========================
-// WEBHOOK
-// =========================
+// =====================================================
+// WEBHOOK INFINITEPAY
+// =====================================================
 
-app.post("/webhook/infinitepay", async (req, res) => {
-  try {
-    const pagamento = req.body || {};
+app.post(
+  "/webhook/infinitepay",
+  async (req, res) => {
+    try {
+      const pagamento = req.body || {};
 
-    console.log(
-      "Webhook InfinitePay recebido:",
-      JSON.stringify(pagamento)
-    );
+      console.log(
+        "Webhook InfinitePay recebido:",
+        JSON.stringify(pagamento)
+      );
 
-    const {
-      order_nsu,
-      transaction_nsu,
-      capture_method,
-      paid_amount
-    } = pagamento;
+      const {
+        order_nsu,
+        transaction_nsu,
+        capture_method,
+        paid_amount,
+        amount
+      } = pagamento;
 
-    if (
-      !order_nsu ||
-      !transaction_nsu
-    ) {
-      return res.status(400).json({
-        success: false,
-        message: "Dados incompletos"
-      });
-    }
+      if (
+        !order_nsu ||
+        !transaction_nsu
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "Dados incompletos"
+        });
+      }
 
-    const pedidoResult = await pool.query(
-      `
-      SELECT *
-      FROM pedidos
-      WHERE order_nsu = $1
-      `,
-      [order_nsu]
-    );
+      // Procura pedido
+      const pedidoResult = await pool.query(
+        `
+        SELECT *
+        FROM pedidos
+        WHERE order_nsu = $1
+        `,
+        [order_nsu]
+      );
 
-    if (pedidoResult.rows.length === 0) {
-      return res.status(400).json({
-        success: false,
-        message: "Pedido não encontrado"
-      });
-    }
+      if (
+        pedidoResult.rows.length === 0
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "Pedido não encontrado"
+        });
+      }
 
-    const pedido = pedidoResult.rows[0];
+      const pedido =
+        pedidoResult.rows[0];
 
-    if (pedido.pago) {
+      // Já contabilizado
+      if (pedido.pago) {
+        return res.status(200).json({
+          success: true,
+          message: null
+        });
+      }
+
+      // Valor original da venda
+      const valor =
+        Number(amount || 0) / 100;
+
+      if (
+        !Number.isFinite(valor) ||
+        valor <= 0
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "Valor inválido"
+        });
+      }
+
+      // Confere o valor
+      if (
+        Math.abs(
+          valor - Number(pedido.valor)
+        ) > 0.01
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "Valor não corresponde ao pedido"
+        });
+      }
+
+      // Salva pagamento
+      await pool.query(
+        `
+        INSERT INTO pagamentos
+          (
+            transaction_nsu,
+            order_nsu,
+            valor,
+            capture_method
+          )
+        VALUES
+          ($1, $2, $3, $4)
+        ON CONFLICT (transaction_nsu)
+        DO NOTHING
+        `,
+        [
+          transaction_nsu,
+          order_nsu,
+          valor,
+          capture_method || "pix"
+        ]
+      );
+
+      // Marca como pago
+      await pool.query(
+        `
+        UPDATE pedidos
+        SET pago = TRUE
+        WHERE order_nsu = $1
+        `,
+        [order_nsu]
+      );
+
+      console.log(
+        `Pagamento confirmado pelo webhook: R$ ${valor.toFixed(2)}`
+      );
+
       return res.status(200).json({
         success: true,
         message: null
       });
-    }
 
-    if (capture_method !== "pix") {
-      return res.status(400).json({
+    } catch (erro) {
+      console.error(
+        "Erro no webhook:",
+        erro
+      );
+
+      return res.status(500).json({
         success: false,
-        message: "Pagamento não é Pix"
+        message: "Erro interno"
       });
     }
-
-    const valor =
-      Number(paid_amount || 0) / 100;
-
-    if (valor <= 0) {
-      return res.status(400).json({
-        success: false,
-        message: "Valor inválido"
-      });
-    }
-
-    await pool.query(
-      `
-      INSERT INTO pagamentos
-        (
-          transaction_nsu,
-          order_nsu,
-          valor,
-          capture_method
-        )
-      VALUES
-        ($1, $2, $3, $4)
-      ON CONFLICT (transaction_nsu)
-      DO NOTHING
-      `,
-      [
-        transaction_nsu,
-        order_nsu,
-        valor,
-        capture_method
-      ]
-    );
-
-    await pool.query(
-      `
-      UPDATE pedidos
-      SET pago = TRUE
-      WHERE order_nsu = $1
-      `,
-      [order_nsu]
-    );
-
-    console.log(
-      `Pagamento confirmado pelo webhook: R$ ${valor.toFixed(2)}`
-    );
-
-    return res.status(200).json({
-      success: true,
-      message: null
-    });
-
-  } catch (erro) {
-    console.error(
-      "Erro no webhook:",
-      erro
-    );
-
-    return res.status(500).json({
-      success: false,
-      message: "Erro interno"
-    });
   }
-});
+);
 
-// =========================
-// INICIAR
-// =========================
+// =====================================================
+// INICIAR SERVIDOR
+// =====================================================
 
 async function iniciarServidor() {
   try {
