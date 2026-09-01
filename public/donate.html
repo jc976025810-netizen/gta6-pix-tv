@@ -1,1 +1,172 @@
 
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Contribuir para o GTA VI</title>
+
+<style>
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: #080b10;
+  color: white;
+  font-family: Arial, sans-serif;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+
+.card {
+  width: 100%;
+  max-width: 500px;
+  background: #11161e;
+  border-radius: 22px;
+  padding: 30px;
+  text-align: center;
+}
+
+h1 {
+  font-size: 40px;
+  color: #ff4fd8;
+}
+
+.valores {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin: 25px 0;
+}
+
+button {
+  padding: 16px;
+  border: 0;
+  border-radius: 12px;
+  background: #252c36;
+  color: white;
+  font-size: 18px;
+  font-weight: bold;
+}
+
+input {
+  width: 100%;
+  padding: 16px;
+  box-sizing: border-box;
+  border-radius: 12px;
+  border: 1px solid #444;
+  background: #080b10;
+  color: white;
+  font-size: 20px;
+  text-align: center;
+  margin-bottom: 15px;
+}
+
+.pix {
+  width: 100%;
+  background: #ff4fd8;
+}
+
+#mensagem {
+  margin-top: 20px;
+  color: #aaa;
+}
+</style>
+</head>
+
+<body>
+
+<div class="card">
+
+<h1>🎮 GTA VI</h1>
+
+<p>Ajude no presente de aniversário! 🎂</p>
+
+<p>Escolha o valor:</p>
+
+<div class="valores">
+  <button onclick="selecionar(10)">R$ 10</button>
+  <button onclick="selecionar(20)">R$ 20</button>
+  <button onclick="selecionar(50)">R$ 50</button>
+  <button onclick="selecionar(100)">R$ 100</button>
+</div>
+
+<input
+  id="valor"
+  type="text"
+  inputmode="decimal"
+  placeholder="Digite outro valor"
+/>
+
+<button class="pix" onclick="pagar()">
+  💰 CONTINUAR PARA O PIX
+</button>
+
+<div id="mensagem"></div>
+
+</div>
+
+<script>
+
+function selecionar(valor) {
+  document.getElementById("valor").value =
+    valor.toFixed(2).replace(".", ",");
+}
+
+async function pagar() {
+
+  let texto = document
+    .getElementById("valor")
+    .value
+    .replace(/\./g, "")
+    .replace(",", ".");
+
+  let valor = Number(texto);
+
+  if (!valor || valor <= 0 || valor > 550) {
+    document.getElementById("mensagem").textContent =
+      "Digite um valor entre R$ 0,01 e R$ 550,00.";
+    return;
+  }
+
+  document.getElementById("mensagem").textContent =
+    "Gerando pagamento...";
+
+  try {
+
+    const resposta = await fetch(
+      "/api/create-payment",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          amount: valor
+        })
+      }
+    );
+
+    const dados = await resposta.json();
+
+    if (dados.url) {
+      window.location.href = dados.url;
+    } else {
+      document.getElementById("mensagem").textContent =
+        dados.error || "Erro ao gerar pagamento.";
+    }
+
+  } catch (erro) {
+
+    document.getElementById("mensagem").textContent =
+      "Erro ao conectar ao servidor.";
+
+  }
+
+}
+
+</script>
+
+</body>
+</html>
