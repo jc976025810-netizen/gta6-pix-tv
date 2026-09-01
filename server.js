@@ -9,15 +9,9 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
 
 const PORT = process.env.PORT || 3000;
-
 const HANDLE = process.env.INFINITEPAY_HANDLE;
 const BASE_URL = process.env.PUBLIC_BASE_URL;
-
 const META = 550;
-
-// =========================
-// BANCO DE DADOS
-// =========================
 
 if (!process.env.DATABASE_URL) {
   console.error("DATABASE_URL não configurada.");
@@ -26,15 +20,14 @@ if (!process.env.DATABASE_URL) {
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  max: 5,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 5000,
-  ssl: process.env.DATABASE_URL.includes("sslmode=require")
-    ? { rejectUnauthorized: false }
-    : undefined
+  ssl: { rejectUnauthorized: false },
+  max: 5
 });
 
-// Cria as tabelas automaticamente
+// =========================
+// BANCO
+// =========================
+
 async function iniciarBanco() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS pedidos (
@@ -42,17 +35,17 @@ async function iniciarBanco() {
       valor NUMERIC(10,2) NOT NULL,
       criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       pago BOOLEAN DEFAULT FALSE
-    );
+    )
   `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS pagamentos (
       transaction_nsu TEXT PRIMARY KEY,
-      order_nsu TEXT NOT NULL REFERENCES pedidos(order_nsu),
+      order_nsu TEXT NOT NULL,
       valor NUMERIC(10,2) NOT NULL,
       capture_method TEXT,
       criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
+    )
   `);
 
   console.log("Banco de dados conectado e tabelas prontas.");
@@ -69,10 +62,8 @@ app.get("/api/meta", async (req, res) => {
       FROM pagamentos
     `);
 
-    const arrecadado = Number(resultado.rows[0].total);
-
     res.json({
-      arrecadado,
+      arrecadado: Number(resultado.rows[0].total),
       meta: META
     });
 
@@ -96,10 +87,212 @@ app.get("/", (req, res) => {
 });
 
 app.get("/doar", async (req, res) => {
-  res.sendFile(
-    path.join(__dirname, "public", "donate.html")
-  );
+  try {
+    const {
+      order_nsu,
+      slug,
+      transaction_nsu,
+      capture_method
+    } = req.query;
+
+    // Se voltou da InfinitePay após um pagamento,
+    // tenta confirmar automaticamente.
+    if (
+      order_nsu &&
+      slug &&
+      transaction_nsu
+    ) {
+      console.log(
+        "Retorno da InfinitePay:",
+        {
+          order_nsu,
+          slug,
+          transaction_nsu,
+          capture_method
+        }
+      );
+
+      await confirmarPagamento({
+        order_nsu,
+        slug,
+        transaction_nsu
+      });
+    }
+
+    res.sendFile(
+      path.join(__dirname, "public", "donate.html")
+    );
+
+  } catch (erro) {
+    console.error(
+      "Erro no retorno do pagamento:",
+      erro
+    );
+
+    res.sendFile(
+      path.join(__dirname, "public", "donate.html")
+    );
+  }
 });
+
+// =========================
+// CONFIRMAR PAGAMENTO
+// =========================
+
+async function confirmarPagamento({
+  order_nsu,
+  slug,
+  transaction_nsu
+}) {
+  try {
+    console.log(
+      "Consultando payment_check:",
+      {
+        order_nsu,
+        transaction_nsu,
+        slug
+      }
+    );
+
+    // Procura o pedido
+    const pedidoResult = await pool.query(
+      `
+      SELECT *
+      FROM pedidos
+      WHERE order_nsu = $1
+      `,
+      [order_nsu]
+    );
+
+    if (pedidoResult.rows.length === 0) {
+      console.warn(
+        "Pedido não encontrado:",
+        order_nsu
+      );
+
+      return false;
+    }
+
+    const pedido = pedidoResult.rows[0];
+
+    // Já foi contabilizado
+    if (pedido.pago) {
+      console.log(
+        "Pedido já estava pago:",
+        order_nsu
+      );
+
+      return true;
+    }
+
+    // Verifica se a transação já existe
+    const existente = await pool.query(
+      `
+      SELECT transaction_nsu
+      FROM pagamentos
+      WHERE transaction_nsu = $1
+      `,
+      [transaction_nsu]
+    );
+
+    if (existente.rows.length > 0) {
+      return true;
+    }
+
+    // Consulta oficial da InfinitePay
+    const resposta = await fetch(
+      "https://api.checkout.infinitepay.io/payment_check",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          handle: HANDLE,
+          order_nsu,
+          transaction_nsu,
+          slug
+        })
+      }
+    );
+
+    const dados = await resposta.json();
+
+    console.log(
+      "Resposta payment_check:",
+      JSON.stringify(dados)
+    );
+
+    if (
+      !resposta.ok ||
+      dados.success !== true ||
+      dados.paid !== true
+    ) {
+      console.warn(
+        "Pagamento não confirmado."
+      );
+
+      return false;
+    }
+
+    const valorPago =
+      Number(dados.paid_amount || dados.amount || 0) / 100;
+
+    if (
+      !Number.isFinite(valorPago) ||
+      valorPago <= 0
+    ) {
+      return false;
+    }
+
+    // Registra pagamento
+    await pool.query(
+      `
+      INSERT INTO pagamentos
+        (
+          transaction_nsu,
+          order_nsu,
+          valor,
+          capture_method
+        )
+      VALUES
+        ($1, $2, $3, $4)
+      ON CONFLICT (transaction_nsu)
+      DO NOTHING
+      `,
+      [
+        transaction_nsu,
+        order_nsu,
+        valorPago,
+        dados.capture_method || "pix"
+      ]
+    );
+
+    // Marca pedido como pago
+    await pool.query(
+      `
+      UPDATE pedidos
+      SET pago = TRUE
+      WHERE order_nsu = $1
+      `,
+      [order_nsu]
+    );
+
+    console.log(
+      `PAGAMENTO CONFIRMADO: R$ ${valorPago.toFixed(2)}`
+    );
+
+    return true;
+
+  } catch (erro) {
+    console.error(
+      "Erro no payment_check:",
+      erro
+    );
+
+    return false;
+  }
+}
 
 // =========================
 // CRIAR CHECKOUT
@@ -120,23 +313,18 @@ app.post("/api/create-payment", async (req, res) => {
     }
 
     if (!HANDLE || !BASE_URL) {
-      console.error(
-        "INFINITEPAY_HANDLE ou PUBLIC_BASE_URL não configurado."
-      );
-
       return res.status(500).json({
         error: "Configuração do pagamento incompleta."
       });
     }
 
-    // Identificação única do pedido
     const order_nsu =
       "GTA6-" +
       Date.now() +
       "-" +
       crypto.randomBytes(4).toString("hex");
 
-    // Salva o pedido ANTES de criar o checkout
+    // Salva pedido
     await pool.query(
       `
       INSERT INTO pedidos
@@ -154,7 +342,7 @@ app.post("/api/create-payment", async (req, res) => {
       handle: HANDLE,
 
       redirect_url:
-        `${BASE_URL}/doar?pagamento=concluido`,
+        `${BASE_URL}/doar`,
 
       webhook_url:
         `${BASE_URL}/webhook/infinitepay`,
@@ -173,9 +361,7 @@ app.post("/api/create-payment", async (req, res) => {
 
     console.log(
       "Criando checkout:",
-      order_nsu,
-      "R$",
-      valor.toFixed(2)
+      order_nsu
     );
 
     const resposta = await fetch(
@@ -233,7 +419,7 @@ app.post("/api/create-payment", async (req, res) => {
 });
 
 // =========================
-// WEBHOOK INFINITEPAY
+// WEBHOOK
 // =========================
 
 app.post("/webhook/infinitepay", async (req, res) => {
@@ -245,33 +431,23 @@ app.post("/webhook/infinitepay", async (req, res) => {
       JSON.stringify(pagamento)
     );
 
-    const order_nsu =
-      pagamento.order_nsu;
+    const {
+      order_nsu,
+      transaction_nsu,
+      capture_method,
+      paid_amount
+    } = pagamento;
 
-    const transaction_nsu =
-      pagamento.transaction_nsu;
-
-    const capture_method =
-      pagamento.capture_method;
-
-    const paid_amount =
-      Number(pagamento.paid_amount || 0);
-
-    if (!order_nsu) {
+    if (
+      !order_nsu ||
+      !transaction_nsu
+    ) {
       return res.status(400).json({
         success: false,
-        message: "order_nsu ausente"
+        message: "Dados incompletos"
       });
     }
 
-    if (!transaction_nsu) {
-      return res.status(400).json({
-        success: false,
-        message: "transaction_nsu ausente"
-      });
-    }
-
-    // Procura o pedido no banco
     const pedidoResult = await pool.query(
       `
       SELECT *
@@ -282,11 +458,6 @@ app.post("/webhook/infinitepay", async (req, res) => {
     );
 
     if (pedidoResult.rows.length === 0) {
-      console.warn(
-        "Pedido não encontrado:",
-        order_nsu
-      );
-
       return res.status(400).json({
         success: false,
         message: "Pedido não encontrado"
@@ -295,7 +466,6 @@ app.post("/webhook/infinitepay", async (req, res) => {
 
     const pedido = pedidoResult.rows[0];
 
-    // Se já foi pago, não conta novamente
     if (pedido.pago) {
       return res.status(200).json({
         success: true,
@@ -303,7 +473,6 @@ app.post("/webhook/infinitepay", async (req, res) => {
       });
     }
 
-    // Verifica se é Pix
     if (capture_method !== "pix") {
       return res.status(400).json({
         success: false,
@@ -311,42 +480,16 @@ app.post("/webhook/infinitepay", async (req, res) => {
       });
     }
 
-    if (
-      !Number.isFinite(paid_amount) ||
-      paid_amount <= 0
-    ) {
+    const valor =
+      Number(paid_amount || 0) / 100;
+
+    if (valor <= 0) {
       return res.status(400).json({
         success: false,
         message: "Valor inválido"
       });
     }
 
-    // paid_amount vem em centavos
-    const valorPago = paid_amount / 100;
-
-    // O valor da contribuição é o valor original do pedido.
-    const valorContribuicao =
-      Number(pedido.valor);
-
-    // Evita duplicidade
-    const pagamentoExistente =
-      await pool.query(
-        `
-        SELECT transaction_nsu
-        FROM pagamentos
-        WHERE transaction_nsu = $1
-        `,
-        [transaction_nsu]
-      );
-
-    if (pagamentoExistente.rows.length > 0) {
-      return res.status(200).json({
-        success: true,
-        message: null
-      });
-    }
-
-    // Registra o pagamento
     await pool.query(
       `
       INSERT INTO pagamentos
@@ -358,16 +501,17 @@ app.post("/webhook/infinitepay", async (req, res) => {
         )
       VALUES
         ($1, $2, $3, $4)
+      ON CONFLICT (transaction_nsu)
+      DO NOTHING
       `,
       [
         transaction_nsu,
         order_nsu,
-        valorContribuicao,
+        valor,
         capture_method
       ]
     );
 
-    // Marca pedido como pago
     await pool.query(
       `
       UPDATE pedidos
@@ -378,10 +522,9 @@ app.post("/webhook/infinitepay", async (req, res) => {
     );
 
     console.log(
-      `Pagamento confirmado: R$ ${valorContribuicao.toFixed(2)}`
+      `Pagamento confirmado pelo webhook: R$ ${valor.toFixed(2)}`
     );
 
-    // Resposta rápida para a InfinitePay
     return res.status(200).json({
       success: true,
       message: null
@@ -401,7 +544,7 @@ app.post("/webhook/infinitepay", async (req, res) => {
 });
 
 // =========================
-// INICIALIZAÇÃO
+// INICIAR
 // =========================
 
 async function iniciarServidor() {
@@ -416,7 +559,7 @@ async function iniciarServidor() {
 
   } catch (erro) {
     console.error(
-      "Não foi possível iniciar:",
+      "Erro ao iniciar servidor:",
       erro
     );
 
